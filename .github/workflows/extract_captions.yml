@@ -1,0 +1,189 @@
+name: Extract Captions
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'YouTube or video URL to extract captions from'
+        required: true
+        type: string
+      issue_number:
+        description: 'Issue number to save results to (optional)'
+        required: false
+        type: string
+      output_format:
+        description: 'Output format for captions'
+        required: false
+        default: 'vtt'
+        type: choice
+        options:
+          - vtt
+          - ttml
+          - srt
+
+jobs:
+  extract_captions:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          sudo apt-get update
+          sudo apt-get -y install ffmpeg
+      
+      - name: Create output directory
+        run: |
+          if [ -n "${{ github.event.inputs.issue_number }}" ]; then
+            mkdir -p "${{ github.event.inputs.issue_number }}/captions"
+            echo "OUTPUT_DIR=${{ github.event.inputs.issue_number }}/captions" >> $GITHUB_ENV
+          else
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            mkdir -p "captions_${TIMESTAMP}"
+            echo "OUTPUT_DIR=captions_${TIMESTAMP}" >> $GITHUB_ENV
+          fi
+      
+      - name: Extract captions
+        run: |
+          echo "Extracting captions from: ${{ github.event.inputs.video_url }}"
+          echo "Output directory: $OUTPUT_DIR"
+          echo "Format: ${{ github.event.inputs.output_format }}"
+          
+          # Try to get manual subtitles first
+          yt-dlp \
+            --all-subs \
+            --skip-download \
+            --sub-format "${{ github.event.inputs.output_format }}/vtt/ttml/best" \
+            --output "$OUTPUT_DIR/%(title)s.%(ext)s" \
+            "${{ github.event.inputs.video_url }}"
+          
+          # Check if we got any subtitle files
+          if [ -z "$(find $OUTPUT_DIR -name '*.${{ github.event.inputs.output_format }}' -o -name '*.vtt' -o -name '*.ttml')" ]; then
+            echo "No manual subtitles found, trying auto-generated captions..."
+            
+            # Try auto-generated captions (English and Russian only)
+            yt-dlp \
+              --write-auto-sub \
+              --skip-download \
+              --sub-format "${{ github.event.inputs.output_format }}/vtt/ttml/best" \
+              --sub-langs "en,ru" \
+              --output "$OUTPUT_DIR/%(title)s.%(ext)s" \
+              "${{ github.event.inputs.video_url }}"
+          fi
+      
+      - name: Process caption files
+        run: |
+          echo "Processing caption files in $OUTPUT_DIR..."
+          find $OUTPUT_DIR -name "*.vtt" -o -name "*.ttml" | head -5 | while read file; do
+            echo "Found caption file: $file"
+            echo "File size: $(wc -c < "$file") bytes"
+            echo "First 10 lines:"
+            head -10 "$file"
+            echo "---"
+          done
+      
+      - name: Convert captions to JSON (if available)
+        run: |
+          # Look for VTT files first
+          VTT_FILE=$(find $OUTPUT_DIR -name "*.vtt" | head -1)
+          if [ -n "$VTT_FILE" ]; then
+            echo "Converting VTT to JSON: $VTT_FILE"
+            if command -v webvtt-to-json &> /dev/null; then
+              webvtt-to-json "$VTT_FILE" --dedupe > "$OUTPUT_DIR/captions.json"
+              echo "JSON captions saved to $OUTPUT_DIR/captions.json"
+            else
+              echo "webvtt-to-json not available, skipping JSON conversion"
+            fi
+          else
+            # Look for TTML files
+            TTML_FILE=$(find $OUTPUT_DIR -name "*.ttml" | head -1)
+            if [ -n "$TTML_FILE" ]; then
+              echo "Converting TTML to JSON: $TTML_FILE"
+              if command -v ttml-to-json &> /dev/null; then
+                ttml-to-json "$TTML_FILE" > "$OUTPUT_DIR/captions.json"
+                echo "JSON captions saved to $OUTPUT_DIR/captions.json"
+              else
+                echo "ttml-to-json not available, skipping JSON conversion"
+              fi
+            fi
+          fi
+      
+      - name: Create summary
+        run: |
+          echo "## Caption Extraction Summary" > caption_summary.md
+          echo "" >> caption_summary.md
+          echo "**Video URL:** ${{ github.event.inputs.video_url }}" >> caption_summary.md
+          echo "**Format:** ${{ github.event.inputs.output_format }}" >> caption_summary.md
+          echo "**Output Directory:** $OUTPUT_DIR" >> caption_summary.md
+          echo "" >> caption_summary.md
+          echo "### Files Created:" >> caption_summary.md
+          find $OUTPUT_DIR -type f | while read file; do
+            echo "- \`$file\` ($(wc -c < "$file") bytes)" >> caption_summary.md
+          done
+          
+          echo "" >> caption_summary.md
+          echo "### Caption Preview:" >> caption_summary.md
+          if [ -f "$OUTPUT_DIR/captions.json" ]; then
+            echo '```json' >> caption_summary.md
+            head -20 "$OUTPUT_DIR/captions.json" >> caption_summary.md
+            echo '```' >> caption_summary.md
+          else
+            # Show first caption file content
+            CAPTION_FILE=$(find $OUTPUT_DIR -name "*.vtt" -o -name "*.ttml" -o -name "*.srt" | head -1)
+            if [ -n "$CAPTION_FILE" ]; then
+              echo "\`\`\`" >> caption_summary.md
+              head -20 "$CAPTION_FILE" >> caption_summary.md
+              echo "\`\`\`" >> caption_summary.md
+            fi
+          fi
+          
+          cat caption_summary.md
+      
+      - name: Comment on issue (if issue number provided)
+        if: github.event.inputs.issue_number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('caption_summary.md', 'utf8');
+            
+            await github.rest.issues.createComment({
+              issue_number: ${{ github.event.inputs.issue_number }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
+      
+      - name: Commit and push results
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            if [ -n "${{ github.event.inputs.issue_number }}" ]; then
+              git commit -m "Extract captions for issue #${{ github.event.inputs.issue_number }}"
+            else
+              git commit -m "Extract captions from ${{ github.event.inputs.video_url }}"
+            fi
+            git pull --rebase
+            git push
+          fi
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: extracted-captions
+          path: |
+            ${{ env.OUTPUT_DIR }}/**
+            caption_summary.md
+          retention-days: 30
